@@ -15,6 +15,8 @@
 #include "LeakyBucket.h"
 #include "Database.h"
 #include "Metrics.h"
+#include "api/JsonCodec.h"
+#include "api/RestController.h"
 #include "policy/PolicyLoader.h"
 #include "policy/PolicyResolver.h"
 
@@ -598,6 +600,108 @@ void testPolicyLoader() {
     }
 }
 
+void testJsonCodec() {
+    section("JSON Codec");
+
+    {
+        auto decoded = JsonCodec::decodeEvaluateRequest(
+            "{\"tenant\":\"tenant-a\",\"endpoint\":\"/login\"}");
+        check(decoded.ok
+              && decoded.request.tenantId == "tenant-a"
+              && decoded.request.endpoint == "/login",
+              "Evaluate JSON decodes tenant and endpoint");
+    }
+
+    {
+        auto decoded = JsonCodec::decodeEvaluateRequest(
+            "{\"tenant\":\"tenant-a\",\"endpoint\":\"/login\",\"role\":\"guest\"}");
+        check(!decoded.ok && decoded.error.find("role") != std::string::npos,
+              "Evaluate JSON rejects role");
+    }
+
+    {
+        auto decoded = JsonCodec::decodePolicy(
+            "{\"priority\":90,\"match\":{\"endpoint\":\"/pay\"},"
+            "\"algorithm\":\"TokenBucket\",\"params\":{\"capacity\":2,\"refillRate\":0}}");
+        check(decoded.ok
+              && decoded.policy.priority == 90
+              && decoded.policy.hasEndpoint
+              && decoded.policy.matchEndpoint == "/pay"
+              && decoded.policy.algorithm == "TokenBucket"
+              && decoded.policy.params["refill"] == 0,
+              "Policy JSON decodes nested match and params");
+    }
+}
+
+std::string testDbPath(const std::string& name);
+void removeTestDb(const std::string& path);
+
+void testRestController() {
+    section("REST Controller");
+
+    {
+        Policy policy;
+        policy.priority = 100;
+        policy.algorithm = "TokenBucket";
+        policy.params["capacity"] = 1;
+        policy.params["refill"] = 0;
+
+        PolicyResolver resolver({policy});
+        PolicyEngine engine;
+        std::string dbPath = testDbPath("test_rest_controller");
+        removeTestDb(dbPath);
+        Database db(dbPath);
+        RestController controller(resolver, engine, db, "");
+
+        HttpRequest req;
+        req.method = "POST";
+        req.path = "/evaluate";
+        req.body = "{\"tenant\":\"tenant-a\",\"endpoint\":\"/login\"}";
+
+        auto first = controller.handleEvaluate(req);
+        auto second = controller.handleEvaluate(req);
+        check(first.status == 200
+              && first.body.find("\"allowed\":true") != std::string::npos
+              && second.status == 200
+              && second.body.find("\"allowed\":false") != std::string::npos,
+              "POST /evaluate returns ALLOW then DENY for capacity-one policy");
+
+        removeTestDb(dbPath);
+    }
+
+    {
+        PolicyResolver resolver;
+        PolicyEngine engine;
+        std::string dbPath = testDbPath("test_rest_policy_db");
+        std::string policyPath = "test_rest_policies.yaml";
+        removeTestDb(dbPath);
+        std::remove(policyPath.c_str());
+        Database db(dbPath);
+        RestController controller(resolver, engine, db, policyPath);
+
+        HttpRequest post;
+        post.method = "POST";
+        post.path = "/policies";
+        post.body = "{\"priority\":10,\"endpoint\":\"/api\","
+                    "\"algorithm\":\"FixedWindowCounter\",\"limit\":3,\"window\":60}";
+
+        auto created = controller.handlePostPolicy(post);
+        HttpRequest get;
+        get.method = "GET";
+        get.path = "/policies";
+        auto listed = controller.handleGetPolicies(get);
+
+        check(created.status == 201
+              && listed.status == 200
+              && listed.body.find("FixedWindowCounter") != std::string::npos
+              && std::ifstream(policyPath).good(),
+              "POST/GET /policies round trip through resolver and policy file");
+
+        removeTestDb(dbPath);
+        std::remove(policyPath.c_str());
+    }
+}
+
 // Database
 
 std::string testDbPath(const std::string& name) {
@@ -808,6 +912,8 @@ int main() {
     testConcurrency();
     testPolicyResolver();
     testPolicyLoader();
+    testJsonCodec();
+    testRestController();
     testDatabase();
     testMetrics();
     testPersistenceIntegration();
