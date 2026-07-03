@@ -1,0 +1,18 @@
+# Build artifacts
+*.exe
+*.out
+*.o
+*.obj
+
+# Local SQLite runtime/test databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
