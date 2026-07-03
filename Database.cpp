@@ -1,126 +1,183 @@
 #include "Database.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 
-Database::Database(const std::string& path)
-    : db_(nullptr), available_(false) {
-    int rc = sqlite3_open(path.c_str(), &db_);
-    if (rc != SQLITE_OK) {
-        std::cerr << "[DB ERROR] " << (db_ ? sqlite3_errmsg(db_) : "cannot open database") << "\n";
-        std::cerr << "[DB WARNING] Persistence disabled; Rlimit will continue in memory.\n";
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
+namespace {
+std::string encodeField(const std::string& value) {
+    std::ostringstream out;
+    out << std::uppercase << std::hex << std::setfill('0');
+    for (unsigned char c : value) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out << static_cast<char>(c);
+        } else {
+            out << '%' << std::setw(2) << static_cast<int>(c);
         }
-        return;
     }
-
-    available_ = true;
-    createTables();
+    return out.str();
 }
 
-Database::~Database() {
-    if (db_) sqlite3_close(db_);
+int hexValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+std::string decodeField(const std::string& value) {
+    std::string out;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '%' && i + 2 < value.size()) {
+            int high = hexValue(value[i + 1]);
+            int low = hexValue(value[i + 2]);
+            if (high >= 0 && low >= 0) {
+                out.push_back(static_cast<char>((high << 4) | low));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(value[i]);
+    }
+    return out;
+}
+
+std::vector<std::string> splitTabs(const std::string& line) {
+    std::vector<std::string> parts;
+    std::stringstream ss(line);
+    std::string part;
+    while (std::getline(ss, part, '\t')) {
+        parts.push_back(part);
+    }
+    return parts;
+}
+}
+
+Database::Database(const std::string& path)
+    : path_(path),
+      available_(false)
+{
+    std::ofstream create(path_, std::ios::app);
+    if (!create) {
+        printError("unable to open " + path_);
+        std::cerr << "[DB WARNING] File persistence disabled; Rlimit will continue in memory.\n";
+        return;
+    }
+    available_ = true;
+    create.close();
+    loadFromFile();
 }
 
 bool Database::isAvailable() const {
     return available_;
 }
 
-void Database::printError() const {
-    std::cerr << "[DB ERROR] " << (db_ ? sqlite3_errmsg(db_) : "database unavailable") << "\n";
+void Database::printError(const std::string& message) const {
+    std::cerr << "[DB ERROR] " << message << "\n";
 }
 
-void Database::createTables() {
-    if (!available_) return;
+void Database::loadFromFile() {
+    tenants_.clear();
+    requests_.clear();
 
-    const char* tenantSql =
-        "CREATE TABLE IF NOT EXISTS tenants ("
-        "id TEXT PRIMARY KEY,"
-        "name TEXT NOT NULL,"
-        "algorithm TEXT NOT NULL,"
-        "params TEXT NOT NULL"
-        ");";
-
-    const char* requestSql =
-        "CREATE TABLE IF NOT EXISTS request_log ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "tenant_id TEXT NOT NULL,"
-        "timestamp_ms INTEGER NOT NULL,"
-        "result TEXT NOT NULL,"
-        "algorithm TEXT NOT NULL,"
-        "state_snapshot TEXT NOT NULL"
-        ");";
-
-    char* err = nullptr;
-    if (sqlite3_exec(db_, tenantSql, nullptr, nullptr, &err) != SQLITE_OK) {
-        std::cerr << "[DB ERROR] " << (err ? err : sqlite3_errmsg(db_)) << "\n";
-        sqlite3_free(err);
+    std::ifstream in(path_);
+    if (!in) {
+        available_ = false;
+        printError("unable to read " + path_);
+        return;
     }
-    err = nullptr;
-    if (sqlite3_exec(db_, requestSql, nullptr, nullptr, &err) != SQLITE_OK) {
-        std::cerr << "[DB ERROR] " << (err ? err : sqlite3_errmsg(db_)) << "\n";
-        sqlite3_free(err);
+
+    std::string line;
+    while (std::getline(in, line)) {
+        auto parts = splitTabs(line);
+        if (parts.empty()) continue;
+
+        if (parts[0] == "TENANT" && parts.size() == 5) {
+            TenantRecord rec;
+            rec.id = decodeField(parts[1]);
+            rec.name = decodeField(parts[2]);
+            rec.algorithm = decodeField(parts[3]);
+            rec.params = decodeField(parts[4]);
+            tenants_.push_back(rec);
+        } else if (parts[0] == "REQUEST" && parts.size() == 6) {
+            StoredRequest stored;
+            stored.tenantId = decodeField(parts[1]);
+            stored.record.timestampMs = std::stoll(parts[2]);
+            stored.record.result = decodeField(parts[3]);
+            stored.record.algorithm = decodeField(parts[4]);
+            stored.record.stateSnapshot = decodeField(parts[5]);
+            requests_.push_back(stored);
+        }
     }
+}
+
+bool Database::flushToFile() const {
+    if (!available_) return false;
+
+    std::ofstream out(path_, std::ios::trunc);
+    if (!out) {
+        printError("unable to write " + path_);
+        return false;
+    }
+
+    for (const auto& tenant : tenants_) {
+        out << "TENANT"
+            << '\t' << encodeField(tenant.id)
+            << '\t' << encodeField(tenant.name)
+            << '\t' << encodeField(tenant.algorithm)
+            << '\t' << encodeField(tenant.params)
+            << '\n';
+    }
+
+    for (const auto& request : requests_) {
+        out << "REQUEST"
+            << '\t' << encodeField(request.tenantId)
+            << '\t' << request.record.timestampMs
+            << '\t' << encodeField(request.record.result)
+            << '\t' << encodeField(request.record.algorithm)
+            << '\t' << encodeField(request.record.stateSnapshot)
+            << '\n';
+    }
+
+    return true;
 }
 
 void Database::saveTenant(const std::string& id, const std::string& name,
                           const std::string& algorithm, const std::string& params) {
     if (!available_) return;
 
-    const char* sql =
-        "INSERT OR REPLACE INTO tenants (id, name, algorithm, params) "
-        "VALUES (?, ?, ?, ?);";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        printError();
-        return;
+    auto it = std::find_if(tenants_.begin(), tenants_.end(),
+        [&](const TenantRecord& rec) { return rec.id == id; });
+
+    TenantRecord rec{id, name, algorithm, params};
+    if (it == tenants_.end()) {
+        tenants_.push_back(rec);
+    } else {
+        *it = rec;
     }
-
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, algorithm.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, params.c_str(), -1, SQLITE_TRANSIENT);
-
-    if (sqlite3_step(stmt) != SQLITE_DONE) printError();
-    sqlite3_finalize(stmt);
+    flushToFile();
 }
 
 void Database::deleteTenant(const std::string& id) {
     if (!available_) return;
 
-    const char* sql = "DELETE FROM tenants WHERE id = ?;";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        printError();
-        return;
-    }
-
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt) != SQLITE_DONE) printError();
-    sqlite3_finalize(stmt);
+    tenants_.erase(std::remove_if(tenants_.begin(), tenants_.end(),
+        [&](const TenantRecord& rec) { return rec.id == id; }), tenants_.end());
+    flushToFile();
 }
 
 std::vector<TenantRecord> Database::loadAllTenants() {
-    std::vector<TenantRecord> tenants;
-    if (!available_) return tenants;
+    if (!available_) return {};
 
-    const char* sql = "SELECT id, name, algorithm, params FROM tenants ORDER BY id;";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        printError();
-        return tenants;
-    }
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        TenantRecord rec;
-        rec.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        rec.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        rec.algorithm = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        rec.params = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-        tenants.push_back(rec);
-    }
-
-    sqlite3_finalize(stmt);
+    auto tenants = tenants_;
+    std::sort(tenants.begin(), tenants.end(),
+        [](const TenantRecord& a, const TenantRecord& b) {
+            return a.id < b.id;
+        });
     return tenants;
 }
 
@@ -129,84 +186,48 @@ void Database::logRequest(const std::string& tenantId, long long timestampMs,
                           const std::string& stateSnapshot) {
     if (!available_) return;
 
-    const char* sql =
-        "INSERT INTO request_log (tenant_id, timestamp_ms, result, algorithm, state_snapshot) "
-        "VALUES (?, ?, ?, ?, ?);";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        printError();
-        return;
-    }
-
-    sqlite3_bind_text(stmt, 1, tenantId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 2, timestampMs);
-    sqlite3_bind_text(stmt, 3, result.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, algorithm.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, stateSnapshot.c_str(), -1, SQLITE_TRANSIENT);
-
-    if (sqlite3_step(stmt) != SQLITE_DONE) printError();
-    sqlite3_finalize(stmt);
+    StoredRequest stored;
+    stored.tenantId = tenantId;
+    stored.record.timestampMs = timestampMs;
+    stored.record.result = result;
+    stored.record.algorithm = algorithm;
+    stored.record.stateSnapshot = stateSnapshot;
+    requests_.push_back(stored);
+    flushToFile();
 }
 
 std::vector<RequestRecord> Database::getRequestLog(const std::string& tenantId, int limit) {
     std::vector<RequestRecord> records;
     if (!available_) return records;
 
-    const char* sql =
-        "SELECT timestamp_ms, result, algorithm, state_snapshot "
-        "FROM request_log WHERE tenant_id = ? "
-        "ORDER BY id DESC LIMIT ?;";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        printError();
-        return records;
+    for (auto it = requests_.rbegin(); it != requests_.rend(); ++it) {
+        if (it->tenantId != tenantId) continue;
+        records.push_back(it->record);
+        if (static_cast<int>(records.size()) >= limit) break;
     }
-
-    sqlite3_bind_text(stmt, 1, tenantId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 2, limit);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        RequestRecord rec;
-        rec.timestampMs = sqlite3_column_int64(stmt, 0);
-        rec.result = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        rec.algorithm = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        rec.stateSnapshot = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-        records.push_back(rec);
-    }
-
-    sqlite3_finalize(stmt);
     return records;
 }
 
-int Database::getCount(const std::string& sql, const std::string& tenantId) {
-    if (!available_) return 0;
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        printError();
-        return 0;
-    }
-
-    sqlite3_bind_text(stmt, 1, tenantId.c_str(), -1, SQLITE_TRANSIENT);
+int Database::getTotalRequests(const std::string& tenantId) {
     int count = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        count = sqlite3_column_int(stmt, 0);
-    } else {
-        printError();
+    for (const auto& request : requests_) {
+        if (request.tenantId == tenantId) ++count;
     }
-
-    sqlite3_finalize(stmt);
     return count;
 }
 
-int Database::getTotalRequests(const std::string& tenantId) {
-    return getCount("SELECT COUNT(*) FROM request_log WHERE tenant_id = ?;", tenantId);
-}
-
 int Database::getTotalAllowed(const std::string& tenantId) {
-    return getCount("SELECT COUNT(*) FROM request_log WHERE tenant_id = ? AND result = 'ALLOW';", tenantId);
+    int count = 0;
+    for (const auto& request : requests_) {
+        if (request.tenantId == tenantId && request.record.result == "ALLOW") ++count;
+    }
+    return count;
 }
 
 int Database::getTotalDenied(const std::string& tenantId) {
-    return getCount("SELECT COUNT(*) FROM request_log WHERE tenant_id = ? AND result = 'DENY';", tenantId);
+    int count = 0;
+    for (const auto& request : requests_) {
+        if (request.tenantId == tenantId && request.record.result == "DENY") ++count;
+    }
+    return count;
 }

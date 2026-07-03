@@ -24,7 +24,7 @@ int envIntOrDefault(const char* name, int fallback) {
 
 int main() {
     std::string policyFile = envOrDefault("POLICY_FILE", "policy/policies.yaml");
-    std::string dbPath = envOrDefault("SQLITE_DB_PATH", "rlimit.db");
+    std::string dbPath = envOrDefault("AUDIT_STORE_PATH", "rlimit_store.txt");
     std::string redisHost = envOrDefault("REDIS_HOST", "localhost");
     int redisPort = envIntOrDefault("REDIS_PORT", 6379);
     int port = envIntOrDefault("HTTP_PORT", 8080);

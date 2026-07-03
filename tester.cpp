@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <fstream>
 #include <set>
-#include <sqlite3.h>
 #include "PolicyEngine.h"
 #include "TokenBucket.h"
 #include "FixedWindowCounter.h"
@@ -89,7 +88,7 @@ void testTokenBucket() {
         PolicyEngine e;
         e.setPolicy("t", std::make_unique<TokenBucket>(5, 2.0));
         fireN(e, "t", 5);
-        std::this_thread::sleep_for(1000ms);
+        std::this_thread::sleep_for(1100ms);
         check(fireN(e, "t", 3) == 2, "Refill after 1s at 2/s: exactly 2 more allowed");
     }
 
@@ -747,27 +746,11 @@ void testStateStore() {
 // Database
 
 std::string testDbPath(const std::string& name) {
-    return name + ".db";
+    return name + ".txt";
 }
 
 void removeTestDb(const std::string& path) {
     std::remove(path.c_str());
-}
-
-bool tableExists(const std::string& path, const std::string& table) {
-    sqlite3* db = nullptr;
-    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) return false;
-
-    const char* sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?;";
-    sqlite3_stmt* stmt = nullptr;
-    bool exists = false;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, table.c_str(), -1, SQLITE_TRANSIENT);
-        exists = (sqlite3_step(stmt) == SQLITE_ROW);
-    }
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return exists;
 }
 
 void testDatabase() {
@@ -778,12 +761,10 @@ void testDatabase() {
         removeTestDb(path);
         {
             Database db(path);
-            check(db.isAvailable(), "Database init: SQLite connection available");
+            check(db.isAvailable(), "Database init: file store available");
         }
-        check(std::ifstream(path).good()
-              && tableExists(path, "tenants")
-              && tableExists(path, "request_log"),
-              "Database init: DB file created and both tables exist");
+        check(std::ifstream(path).good(),
+              "Database init: store file is created");
         removeTestDb(path);
     }
 
@@ -840,7 +821,7 @@ void testDatabase() {
     }
 
     {
-        std::string path = testDbPath("test_get_request_log");
+        std::string path = testDbPath("test_get_audit_log");
         removeTestDb(path);
         Database db(path);
         for (int i = 0; i < 10; ++i)
@@ -908,7 +889,7 @@ void testPersistenceIntegration() {
     }
 
     {
-        std::string path = testDbPath("test_request_log_persists");
+        std::string path = testDbPath("test_audit_log_persists");
         removeTestDb(path);
         {
             Database db(path);

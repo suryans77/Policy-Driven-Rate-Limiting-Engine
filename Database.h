@@ -1,6 +1,5 @@
 #pragma once
 
-#include <sqlite3.h>
 #include <string>
 #include <vector>
 
@@ -20,8 +19,8 @@ struct RequestRecord {
 
 class Database {
 public:
-    explicit Database(const std::string& path = "rlimit.db");
-    ~Database();
+    explicit Database(const std::string& path = "rlimit_store.txt");
+    ~Database() = default;
 
     Database(const Database&) = delete;
     Database& operator=(const Database&) = delete;
@@ -43,10 +42,18 @@ public:
     int getTotalDenied(const std::string& tenantId);
 
 private:
-    sqlite3* db_;
+    struct StoredRequest {
+        std::string tenantId;
+        RequestRecord record;
+    };
+
+    std::string path_;
     bool available_;
 
-    void createTables();
-    void printError() const;
-    int getCount(const std::string& sql, const std::string& tenantId);
+    std::vector<TenantRecord> tenants_;
+    std::vector<StoredRequest> requests_;
+
+    void loadFromFile();
+    bool flushToFile() const;
+    void printError(const std::string& message) const;
 };

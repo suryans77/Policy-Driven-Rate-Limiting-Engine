@@ -1,6 +1,6 @@
 # Rlimit
 
-Rlimit is a backend-focused C++ rate limiting engine that demonstrates how production API gateways, SaaS platforms, and multi-tenant backend systems control request traffic. It implements five classic rate limiting algorithms, a thread-safe policy engine, SQLite-backed persistence, request audit logging, benchmark metrics, and a CLI for interactive simulation.
+Rlimit is a backend-focused C++ rate limiting engine that demonstrates how production API gateways, SaaS platforms, and multi-tenant backend systems control request traffic. It implements five classic rate limiting algorithms, a thread-safe policy engine, dependency-free local audit storage, Redis-backed distributed state, benchmark metrics, and a CLI for interactive simulation.
 
 In a real backend system, rate limiting protects downstream services from overload, prevents abusive clients from consuming shared capacity, and gives each tenant predictable access to system resources. Rlimit models that problem directly: each tenant can be assigned a different algorithm and parameter set, requests are evaluated through a central policy engine, internal algorithm state can be inspected, and every evaluated request can be written to an audit log.
 
@@ -23,8 +23,8 @@ Per-tenant policy registration
 PolicyResolver with tenant/endpoint matching from policy/policies.yaml
 REST API for /evaluate and /policies
 Redis-backed distributed state for TokenBucket, FixedWindowCounter, SlidingWindowCounter, and LeakyBucket
-Tenant policy persistence using SQLite
-Request audit logging using SQLite
+Tenant policy persistence using a local text store
+Request audit logging using a local text store
 CLI menu for simulations and inspection
 Burst simulation with configurable interval
 Thread-safety stress test
@@ -62,9 +62,9 @@ Automated test suite with 71 passing tests
                                     |
                                     v
                          +----------------------+
-                         |       SQLite         |
-                         |    Rlimit.db      |
-                         | tenants/request_log  |
+                         |    Local file store  |
+                         | rlimit_store.txt     |
+                         | tenants/request log  |
                          +----------------------+
 
                          +----------------------+
@@ -78,7 +78,7 @@ The CLI is the user-facing control layer. It does not implement rate limiting lo
 
 `PolicyEngine` owns one strategy object per tenant. Each concrete algorithm implements the shared `RateLimitStrategy` interface. This keeps the runtime behavior polymorphic while allowing the CLI and tests to treat all algorithms the same way.
 
-SQLite sits beside the engine. It stores tenant policy definitions and request audit logs. On startup, Rlimit loads tenant policies from `Rlimit.db` and reconstructs the corresponding in-memory algorithm objects.
+The local file store sits beside the engine. It stores CLI tenant policy definitions and request audit logs. On startup, Rlimit loads tenant policies from `rlimit_store.txt` and reconstructs the corresponding in-memory algorithm objects. REST policy configuration lives in `policy/policies.yaml`, while live distributed limiter state lives in Redis.
 
 The metrics system is intentionally separate from the live `PolicyEngine`. Benchmarks create fresh algorithm instances internally so measurement does not mutate real tenant state.
 
@@ -101,7 +101,7 @@ flowchart TD
     J --> L["Read getState snapshot"]
     K --> L
     L --> M["Database::logRequest"]
-    M --> N["request_log row persisted"]
+    M --> N["local audit row persisted"]
 ```
 
 Important detail:
@@ -491,12 +491,12 @@ Space: O(1)
 
 ## Persistence Architecture
 
-Rlimit uses SQLite for local persistence.
+Rlimit uses a small local text store for CLI policy persistence and request audit history. It has no external database dependency.
 
-Database file:
+Default store file:
 
 ```text
-Rlimit.db
+rlimit_store.txt
 ```
 
 Database wrapper:
@@ -509,53 +509,25 @@ Database.cpp
 Responsibilities:
 
 ```text
-Open SQLite connection
-Create required tables on startup
 Save tenant policies
 Delete tenant policies
 Load all tenant policies on program startup
 Log every evaluated request
 Return request audit logs
 Return aggregate allowed/denied request counts
-Gracefully degrade if SQLite cannot be opened
+Gracefully degrade if the local store cannot be opened
 ```
 
-If SQLite cannot open the database, Rlimit prints a warning and continues running in memory:
+If the local store cannot be opened, Rlimit prints a warning and continues running in memory:
 
 ```text
-[DB ERROR] unable to open database file
+[DB ERROR] unable to open rlimit_store.txt
 [DB WARNING] Persistence disabled; Rlimit will continue in memory.
 ```
 
 ---
 
-## Database Schema
-
-Tenant policies:
-
-```sql
-CREATE TABLE IF NOT EXISTS tenants (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    algorithm   TEXT NOT NULL,
-    params      TEXT NOT NULL
-);
-```
-
-Request audit log:
-
-```sql
-CREATE TABLE IF NOT EXISTS request_log (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id       TEXT NOT NULL,
-    timestamp_ms    INTEGER NOT NULL,
-    result          TEXT NOT NULL,
-    algorithm       TEXT NOT NULL,
-    state_snapshot  TEXT NOT NULL
-);
-```
-
-The `params` column stores constructor arguments in a compact pipe-separated format.
+The local store writes percent-escaped tab-separated rows. `TENANT` rows hold CLI policy definitions, and `REQUEST` rows hold audit history. The `params` field stores constructor arguments in a compact pipe-separated format.
 
 Examples:
 
@@ -712,8 +684,10 @@ RateLimiter/
   Metrics.h
   Metrics.cpp
   tester.cpp
-  Rlimit_Phase6_Prompt.md
-  Rlimit.db
+  policy/
+  api/
+  storage/
+  rlimit_store.txt
 ```
 
 Generated files after building:
@@ -736,7 +710,6 @@ std::lock_guard
 std::thread
 std::atomic
 std::chrono
-SQLite3
 CLI application
 Manual test harness
 ```
@@ -749,24 +722,22 @@ You need:
 
 ```text
 C++ compiler with C++17 support
-SQLite3 development library
 pthread support
 ```
 
-On Windows with MinGW/MSYS2, make sure `g++` and SQLite are available on PATH.
+On Windows with MinGW/MSYS2, make sure `g++` is available on PATH.
 
 On Linux:
 
 ```bash
 sudo apt update
-sudo apt install g++ libsqlite3-dev
+sudo apt install g++
 ```
 
 On macOS:
 
 ```bash
 xcode-select --install
-brew install sqlite
 ```
 
 ---
@@ -776,13 +747,13 @@ brew install sqlite
 From the project root:
 
 ```bash
-g++ -std=c++17 -O2 -pthread -o Rlimit main.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp Database.cpp Metrics.cpp -lsqlite3
+g++ -std=c++17 -O2 -pthread -o Rlimit main.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp Database.cpp Metrics.cpp
 ```
 
 On Windows, you can output an `.exe`:
 
 ```powershell
-g++ -std=c++17 -O2 -pthread -o Rlimit.exe main.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp Database.cpp Metrics.cpp -lsqlite3
+g++ -std=c++17 -O2 -pthread -o Rlimit.exe main.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp Database.cpp Metrics.cpp
 ```
 
 ---
@@ -817,7 +788,7 @@ g++ -std=c++17 -O2 -pthread -I. -o rlimit_server \
   api/JsonCodec.cpp api/RestController.cpp api/Server.cpp \
   policy/Policy.cpp policy/PolicyResolver.cpp policy/PolicyLoader.cpp \
   storage/StateStore.cpp storage/InMemoryStateStore.cpp storage/RedisStateStore.cpp \
-  storage/RedisRateLimitStrategies.cpp -lsqlite3
+  storage/RedisRateLimitStrategies.cpp
 ```
 
 Windows builds also need `-lws2_32` for sockets.
@@ -829,7 +800,7 @@ HTTP_PORT=8080
 REDIS_HOST=localhost
 REDIS_PORT=6379
 POLICY_FILE=policy/policies.yaml
-SQLITE_DB_PATH=rlimit.db
+AUDIT_STORE_PATH=rlimit_store.txt
 ```
 
 Start Redis, then run:
@@ -854,17 +825,6 @@ Docker:
 docker compose up --build
 ```
 
-CMake targets are also provided for environments with CMake installed:
-
-```bash
-cmake -S . -B build
-cmake --build build
-```
-
-Targets: `rlimit_cli`, `rlimit_server`, and `rlimit_tester`.
-
----
-
 ## Build and Run Tests
 
 Build test runner:
@@ -877,13 +837,13 @@ g++ -std=c++17 -O2 -pthread -I. -o tester \
   api/JsonCodec.cpp api/RestController.cpp api/Server.cpp \
   policy/Policy.cpp policy/PolicyResolver.cpp policy/PolicyLoader.cpp \
   storage/StateStore.cpp storage/InMemoryStateStore.cpp storage/RedisStateStore.cpp \
-  storage/RedisRateLimitStrategies.cpp -lsqlite3
+  storage/RedisRateLimitStrategies.cpp
 ```
 
 Windows PowerShell:
 
 ```powershell
-g++ -std=c++17 -O2 -pthread -I. -o tester.exe tester.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp Database.cpp Metrics.cpp StrategyFactory.cpp api/JsonCodec.cpp api/RestController.cpp api/Server.cpp policy/Policy.cpp policy/PolicyResolver.cpp policy/PolicyLoader.cpp storage/StateStore.cpp storage/InMemoryStateStore.cpp storage/RedisStateStore.cpp storage/RedisRateLimitStrategies.cpp -lsqlite3 -lws2_32
+g++ -std=c++17 -O2 -pthread -I. -o tester.exe tester.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp Database.cpp Metrics.cpp StrategyFactory.cpp api/JsonCodec.cpp api/RestController.cpp api/Server.cpp policy/Policy.cpp policy/PolicyResolver.cpp policy/PolicyLoader.cpp storage/StateStore.cpp storage/InMemoryStateStore.cpp storage/RedisStateStore.cpp storage/RedisRateLimitStrategies.cpp -lws2_32
 ```
 
 Run tests:
@@ -944,7 +904,7 @@ Algorithm: TokenBucket
 Params: capacity=5|refill=1
 ```
 
-The policy is saved to SQLite and restored on the next startup.
+The policy is saved to the local store and restored on the next startup.
 
 ---
 
@@ -968,7 +928,7 @@ If the tenant exceeds the policy:
 [     18ms]  [DENIED]   tokens=0.00/5.00 refill=1.00/s
 ```
 
-Each request is also written to `request_log`.
+Each request is also written to the local audit log.
 
 ---
 
@@ -1161,7 +1121,7 @@ Thread-safe evaluation
 Unsafe race demonstration
 Tenant isolation
 Strategy reset behavior
-SQLite initialization
+Local file store initialization
 Tenant save/load/upsert/delete
 Request logging and aggregate counts
 Audit log limit behavior
@@ -1189,7 +1149,7 @@ Polymorphic strategy pattern
 Thread safety with mutexes
 Race condition reproduction
 Per-tenant isolation
-SQLite persistence
+Local file persistence
 Audit logging
 Benchmarking
 Accuracy vs performance tradeoffs
@@ -1263,14 +1223,13 @@ The measured difference
 
 That is more convincing than only saying "mutexes are important."
 
-### Why SQLite?
+### Why a local file store?
 
-SQLite gives the project persistence without needing an external database server.
+The local file store gives the CLI and audit log persistence without a database dependency.
 
 It is enough to demonstrate:
 
 ```text
-Schema design
 Upsert behavior
 Startup restore
 Audit logging
@@ -1290,7 +1249,6 @@ Persist live algorithm state, not only policy definitions
 Add per-tenant metrics dashboards
 Add Prometheus-style metrics output
 Add configurable benchmark request counts
-Add CMake build support
 Add GitHub Actions CI
 Add Dockerfile for reproducible builds
 ```
