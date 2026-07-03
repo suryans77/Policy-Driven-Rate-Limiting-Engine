@@ -5,6 +5,8 @@
 #include "SlidingWindowCounter.h"
 #include "SlidingWindowLog.h"
 #include "TokenBucket.h"
+#include "storage/RedisRateLimitStrategies.h"
+#include "storage/StateStore.h"
 
 #include <sstream>
 
@@ -63,6 +65,19 @@ std::unique_ptr<RateLimitStrategy> createStrategy(
 
     if (error) *error = "unsupported algorithm: " + algorithm;
     return nullptr;
+}
+
+std::unique_ptr<RateLimitStrategy> createStrategy(
+    const std::string& algorithm,
+    const std::map<std::string, double>& params,
+    StateStore* store,
+    const std::string& stateKey,
+    std::string* error) {
+    std::string normalized = normalizeAlgorithmName(algorithm);
+    if (store && store->supportsAtomicScripts() && normalized != "SlidingWindowLog") {
+        return createRedisBackedStrategy(normalized, params, *store, stateKey, error);
+    }
+    return createStrategy(normalized, params, error);
 }
 
 std::string buildPolicyKey(const std::string& tenantId, const Policy& policy) {

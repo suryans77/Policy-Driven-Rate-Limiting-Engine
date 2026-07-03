@@ -4,6 +4,7 @@
 #include "api/Server.h"
 #include "policy/PolicyLoader.h"
 #include "policy/PolicyResolver.h"
+#include "storage/RedisStateStore.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -24,6 +25,8 @@ int envIntOrDefault(const char* name, int fallback) {
 int main() {
     std::string policyFile = envOrDefault("POLICY_FILE", "policy/policies.yaml");
     std::string dbPath = envOrDefault("SQLITE_DB_PATH", "rlimit.db");
+    std::string redisHost = envOrDefault("REDIS_HOST", "localhost");
+    int redisPort = envIntOrDefault("REDIS_PORT", 6379);
     int port = envIntOrDefault("HTTP_PORT", 8080);
 
     auto loaded = PolicyLoader::loadFromFile(policyFile);
@@ -35,7 +38,8 @@ int main() {
     PolicyResolver resolver(loaded.policies);
     PolicyEngine engine;
     Database db(dbPath);
-    RestController controller(resolver, engine, db, policyFile);
+    RedisStateStore redis(redisHost, redisPort);
+    RestController controller(resolver, engine, db, policyFile, &redis);
     Server server(controller, port);
     server.run();
     return 0;

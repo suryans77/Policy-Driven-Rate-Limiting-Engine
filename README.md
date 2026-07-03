@@ -20,6 +20,9 @@ Five rate limiting algorithms
 Thread-safe PolicyEngine using std::mutex
 Intentional unsafe evaluation path for race-condition demonstration
 Per-tenant policy registration
+PolicyResolver with tenant/endpoint matching from policy/policies.yaml
+REST API for /evaluate and /policies
+Redis-backed distributed state for TokenBucket, FixedWindowCounter, SlidingWindowCounter, and LeakyBucket
 Tenant policy persistence using SQLite
 Request audit logging using SQLite
 CLI menu for simulations and inspection
@@ -29,7 +32,7 @@ Standalone benchmark suite
 Throughput benchmarking across all algorithms
 Concurrency race variance measurement
 SlidingWindowCounter accuracy comparison against SlidingWindowLog
-Automated test suite with 56 passing tests
+Automated test suite with 71 passing tests
 ```
 
 ---
@@ -800,18 +803,87 @@ Windows PowerShell:
 
 ---
 
+## Build and Run the REST API
+
+The REST server is a separate entry point that keeps the CLI behavior intact.
+
+Linux/macOS:
+
+```bash
+g++ -std=c++17 -O2 -pthread -I. -o rlimit_server \
+  server_main.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp \
+  SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp \
+  Database.cpp StrategyFactory.cpp \
+  api/JsonCodec.cpp api/RestController.cpp api/Server.cpp \
+  policy/Policy.cpp policy/PolicyResolver.cpp policy/PolicyLoader.cpp \
+  storage/StateStore.cpp storage/InMemoryStateStore.cpp storage/RedisStateStore.cpp \
+  storage/RedisRateLimitStrategies.cpp -lsqlite3
+```
+
+Windows builds also need `-lws2_32` for sockets.
+
+Runtime configuration:
+
+```text
+HTTP_PORT=8080
+REDIS_HOST=localhost
+REDIS_PORT=6379
+POLICY_FILE=policy/policies.yaml
+SQLITE_DB_PATH=rlimit.db
+```
+
+Start Redis, then run:
+
+```bash
+./rlimit_server
+```
+
+Example request:
+
+```bash
+curl -X POST http://localhost:8080/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{"tenant":"tenant-a","endpoint":"/login"}'
+```
+
+Policy requests intentionally use tenant and endpoint only. Role is not accepted because this project does not implement authentication.
+
+Docker:
+
+```bash
+docker compose up --build
+```
+
+CMake targets are also provided for environments with CMake installed:
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+Targets: `rlimit_cli`, `rlimit_server`, and `rlimit_tester`.
+
+---
+
 ## Build and Run Tests
 
 Build test runner:
 
 ```bash
-g++ -std=c++17 -O2 -pthread -o tester tester.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp Database.cpp Metrics.cpp -lsqlite3
+g++ -std=c++17 -O2 -pthread -I. -o tester \
+  tester.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp \
+  SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp \
+  Database.cpp Metrics.cpp StrategyFactory.cpp \
+  api/JsonCodec.cpp api/RestController.cpp api/Server.cpp \
+  policy/Policy.cpp policy/PolicyResolver.cpp policy/PolicyLoader.cpp \
+  storage/StateStore.cpp storage/InMemoryStateStore.cpp storage/RedisStateStore.cpp \
+  storage/RedisRateLimitStrategies.cpp -lsqlite3
 ```
 
 Windows PowerShell:
 
 ```powershell
-g++ -std=c++17 -O2 -pthread -o tester.exe tester.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp Database.cpp Metrics.cpp -lsqlite3
+g++ -std=c++17 -O2 -pthread -I. -o tester.exe tester.cpp PolicyEngine.cpp TokenBucket.cpp LeakyBucket.cpp SlidingWindowCounter.cpp SlidingWindowLog.cpp FixedWindowCounter.cpp Database.cpp Metrics.cpp StrategyFactory.cpp api/JsonCodec.cpp api/RestController.cpp api/Server.cpp policy/Policy.cpp policy/PolicyResolver.cpp policy/PolicyLoader.cpp storage/StateStore.cpp storage/InMemoryStateStore.cpp storage/RedisStateStore.cpp storage/RedisRateLimitStrategies.cpp -lsqlite3 -lws2_32
 ```
 
 Run tests:
@@ -832,7 +904,7 @@ Expected summary:
 +------------------------------+
 |        TEST SUMMARY          |
 +------------------------------+
-  Passed: 56
+  Passed: 71
   Failed: 0
 +------------------------------+
 ```
@@ -1102,7 +1174,7 @@ Graceful database degradation
 Current result:
 
 ```text
-56/56 tests passing
+71/71 tests passing
 ```
 
 ---

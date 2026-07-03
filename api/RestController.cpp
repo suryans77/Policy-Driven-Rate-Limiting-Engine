@@ -18,11 +18,13 @@ long long toEpochMs(const std::chrono::system_clock::time_point& time) {
 RestController::RestController(PolicyResolver& resolver,
                                PolicyEngine& engine,
                                Database& db,
-                               const std::string& policyFilePath)
+                               const std::string& policyFilePath,
+                               StateStore* stateStore)
     : resolver_(resolver),
       engine_(engine),
       db_(db),
-      policyFilePath_(policyFilePath)
+      policyFilePath_(policyFilePath),
+      stateStore_(stateStore)
 {}
 
 HttpResponse RestController::handleRequest(const HttpRequest& req) {
@@ -52,7 +54,7 @@ HttpResponse RestController::handleEvaluate(const HttpRequest& req) {
     std::string policyKey = buildPolicyKey(decoded.request.tenantId, policy);
     if (!engine_.hasTenant(policyKey)) {
         std::string error;
-        auto strategy = createStrategy(policy.algorithm, policy.params, &error);
+        auto strategy = createStrategy(policy.algorithm, policy.params, stateStore_, policyKey, &error);
         if (!strategy) {
             return HttpResponse::json(400, JsonCodec::encodeError(error));
         }

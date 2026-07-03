@@ -15,10 +15,12 @@
 #include "LeakyBucket.h"
 #include "Database.h"
 #include "Metrics.h"
+#include "StrategyFactory.h"
 #include "api/JsonCodec.h"
 #include "api/RestController.h"
 #include "policy/PolicyLoader.h"
 #include "policy/PolicyResolver.h"
+#include "storage/InMemoryStateStore.h"
 
 using namespace std::chrono_literals;
 
@@ -702,6 +704,46 @@ void testRestController() {
     }
 }
 
+void testStateStore() {
+    section("State Store");
+
+    {
+        InMemoryStateStore store;
+        std::string value;
+        store.set("k", "v");
+        check(store.get("k", value) && value == "v",
+              "InMemoryStateStore get/set round trip");
+    }
+
+    {
+        InMemoryStateStore store;
+        check(store.incr("counter") == 1
+              && store.incr("counter") == 2,
+              "InMemoryStateStore incr is monotonic");
+    }
+
+    {
+        InMemoryStateStore store;
+        store.set("short", "lived");
+        store.expire("short", 1);
+        std::this_thread::sleep_for(1100ms);
+        std::string value;
+        check(!store.get("short", value),
+              "InMemoryStateStore expire removes old keys");
+    }
+
+    {
+        InMemoryStateStore store;
+        std::map<std::string, double> params;
+        params["capacity"] = 1;
+        params["refill"] = 0;
+        std::string error;
+        auto strategy = createStrategy("TokenBucket", params, &store, "tenant|tb", &error);
+        check(strategy && strategy->allowRequest() && !strategy->allowRequest(),
+              "StrategyFactory falls back to in-memory strategy when scripts are unavailable");
+    }
+}
+
 // Database
 
 std::string testDbPath(const std::string& name) {
@@ -914,6 +956,7 @@ int main() {
     testPolicyLoader();
     testJsonCodec();
     testRestController();
+    testStateStore();
     testDatabase();
     testMetrics();
     testPersistenceIntegration();

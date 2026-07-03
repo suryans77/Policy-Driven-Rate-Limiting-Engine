@@ -7,12 +7,15 @@
 
 #include <string>
 
+class StateStore;
+
 class RestController {
 public:
     RestController(PolicyResolver& resolver,
                    PolicyEngine& engine,
                    Database& db,
-                   const std::string& policyFilePath = "policy/policies.yaml");
+                   const std::string& policyFilePath = "policy/policies.yaml",
+                   StateStore* stateStore = nullptr);
 
     HttpResponse handleRequest(const HttpRequest& req);
     HttpResponse handleEvaluate(const HttpRequest& req);
@@ -24,4 +27,5 @@ private:
     PolicyEngine& engine_;
     Database& db_;
     std::string policyFilePath_;
+    StateStore* stateStore_;
 };
