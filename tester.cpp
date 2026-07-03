@@ -15,6 +15,8 @@
 #include "LeakyBucket.h"
 #include "Database.h"
 #include "Metrics.h"
+#include "policy/PolicyLoader.h"
+#include "policy/PolicyResolver.h"
 
 using namespace std::chrono_literals;
 
@@ -461,6 +463,141 @@ void testConcurrency() {
     }
 }
 
+void testPolicyResolver() {
+    section("Policy Resolver");
+
+    {
+        Policy login;
+        login.priority = 100;
+        login.hasEndpoint = true;
+        login.matchEndpoint = "/login";
+        login.algorithm = "TokenBucket";
+        login.params["capacity"] = 10;
+        login.params["refill"] = 1;
+
+        Policy tenant;
+        tenant.priority = 50;
+        tenant.hasTenant = true;
+        tenant.matchTenant = "tenant-a";
+        tenant.algorithm = "FixedWindowCounter";
+        tenant.params["limit"] = 5;
+        tenant.params["window"] = 60;
+
+        PolicyResolver resolver({tenant, login});
+        Policy resolved;
+        bool ok = resolver.resolve(Request("tenant-a", "/login"), resolved);
+        check(ok && resolved.algorithm == "TokenBucket",
+              "Highest priority endpoint policy wins over tenant policy");
+    }
+
+    {
+        Policy tenant;
+        tenant.priority = 50;
+        tenant.hasTenant = true;
+        tenant.matchTenant = "tenant-a";
+        tenant.algorithm = "SlidingWindowCounter";
+        tenant.params["limit"] = 20;
+        tenant.params["window"] = 10;
+
+        Policy fallback;
+        fallback.priority = 1;
+        fallback.algorithm = "FixedWindowCounter";
+        fallback.params["limit"] = 100;
+        fallback.params["window"] = 60;
+
+        PolicyResolver resolver({fallback, tenant});
+        Policy resolved;
+        bool tenantOk = resolver.resolve(Request("tenant-a", "/any"), resolved);
+        std::string tenantAlgorithm = resolved.algorithm;
+        bool fallbackOk = resolver.resolve(Request("tenant-b", "/any"), resolved);
+        std::string fallbackAlgorithm = resolved.algorithm;
+        check(tenantOk && tenantAlgorithm == "SlidingWindowCounter"
+              && fallbackOk && fallbackAlgorithm == "FixedWindowCounter",
+              "Unset match fields are wildcards and default policy is used");
+    }
+
+    {
+        Policy first;
+        first.priority = 10;
+        first.hasEndpoint = true;
+        first.matchEndpoint = "/tie";
+        first.algorithm = "TokenBucket";
+        first.params["capacity"] = 1;
+        first.params["refill"] = 0;
+
+        Policy second = first;
+        second.algorithm = "LeakyBucket";
+        second.params.clear();
+        second.params["capacity"] = 1;
+        second.params["leakRate"] = 1;
+
+        PolicyResolver resolver({first, second});
+        Policy resolved;
+        bool ok = resolver.resolve(Request("tenant", "/tie"), resolved);
+        check(ok && resolved.algorithm == "TokenBucket",
+              "Equal priority keeps file/vector order as tiebreak");
+    }
+
+    {
+        PolicyResolver resolver;
+        Policy resolved;
+        check(!resolver.resolve(Request("tenant", "/missing"), resolved),
+              "No matching policy returns false");
+    }
+}
+
+void writeTextFile(const std::string& path, const std::string& text) {
+    std::ofstream out(path);
+    out << text;
+}
+
+void testPolicyLoader() {
+    section("Policy Loader");
+
+    {
+        std::string path = "test_policies.yaml";
+        writeTextFile(path,
+            "- priority: 5\n"
+            "  match:\n"
+            "    tenant: \"tenant-a\"\n"
+            "  algorithm: FixedWindow\n"
+            "  limit: 3\n"
+            "  window: 1\n"
+            "- priority: 100\n"
+            "  match:\n"
+            "    endpoint: \"/login\"\n"
+            "  algorithm: TokenBucket\n"
+            "  capacity: 10\n"
+            "  refillRate: 2\n");
+
+        auto loaded = PolicyLoader::loadFromFile(path);
+        check(loaded.ok
+              && loaded.policies.size() == 2
+              && loaded.policies[0].priority == 100
+              && loaded.policies[0].algorithm == "TokenBucket"
+              && loaded.policies[0].params.count("refill") == 1
+              && loaded.policies[1].algorithm == "FixedWindowCounter",
+              "YAML policy file parses, normalizes names, and sorts by priority");
+        std::remove(path.c_str());
+    }
+
+    {
+        std::string path = "test_policy_role.yaml";
+        writeTextFile(path,
+            "- priority: 10\n"
+            "  match:\n"
+            "    role: \"guest\"\n"
+            "  algorithm: TokenBucket\n"
+            "  capacity: 1\n"
+            "  refillRate: 1\n");
+
+        auto loaded = PolicyLoader::loadFromFile(path);
+        check(!loaded.ok && loaded.error.find("role") != std::string::npos,
+              "PolicyLoader rejects role-dependent config");
+        std::remove(path.c_str());
+    }
+}
+
 // Database
 
 std::string testDbPath(const std::string& name) {
@@ -669,6 +806,8 @@ int main() {
     testSlidingWindowCounter();
     testLeakyBucket();
     testConcurrency();
+    testPolicyResolver();
+    testPolicyLoader();
     testDatabase();
     testMetrics();
     testPersistenceIntegration();

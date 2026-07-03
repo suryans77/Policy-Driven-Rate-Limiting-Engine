@@ -1,0 +1,18 @@
+- priority: 100
+  match:
+    endpoint: "/login"
+  algorithm: TokenBucket
+  capacity: 10
+  refillRate: 1
+
+- priority: 50
+  match:
+    tenant: "premium-tenant"
+  algorithm: SlidingWindowCounter
+  limit: 1000
+  window: 60
+
+- priority: 1
+  algorithm: FixedWindowCounter
+  limit: 100
+  window: 60

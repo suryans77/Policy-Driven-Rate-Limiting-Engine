@@ -6,6 +6,14 @@ void PolicyEngine::setPolicy(const std::string& tenantId,
     tenantPolicies_[tenantId] = std::move(strategy);
 }
 
+bool PolicyEngine::ensurePolicy(const std::string& tenantId,
+                                std::unique_ptr<RateLimitStrategy> strategy) {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    if (tenantPolicies_.count(tenantId) > 0) return false;
+    tenantPolicies_[tenantId] = std::move(strategy);
+    return true;
+}
+
 bool PolicyEngine::evaluate(const std::string& tenantId) {
     std::lock_guard<std::mutex> lock(engineMutex_);
     auto it = tenantPolicies_.find(tenantId);

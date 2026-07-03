@@ -9,6 +9,8 @@ class PolicyEngine {
 public:
     void setPolicy(const std::string& tenantId,
                    std::unique_ptr<RateLimitStrategy> strategy);
+    bool ensurePolicy(const std::string& tenantId,
+                      std::unique_ptr<RateLimitStrategy> strategy);
 
     // Thread-safe evaluate (mutex locked)
     bool evaluate(const std::string& tenantId);
