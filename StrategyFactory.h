@@ -22,3 +22,6 @@ std::unique_ptr<RateLimitStrategy> createStrategy(
     std::string* error = nullptr);
 
 std::string buildPolicyKey(const std::string& tenantId, const Policy& policy);
+std::string buildPolicyKey(const std::string& tenantId,
+                           const std::string& endpoint,
+                           const Policy& policy);

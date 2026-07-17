@@ -21,6 +21,36 @@
 #include "policy/PolicyResolver.h"
 #include "storage/InMemoryStateStore.h"
 
+class RecordingScriptStore : public StateStore {
+public:
+    bool get(const std::string&, std::string&) override { return false; }
+    void set(const std::string&, const std::string&) override {}
+    long long incr(const std::string&) override { return 0; }
+    void expire(const std::string&, int) override {}
+    bool supportsAtomicScripts() const override { return true; }
+    bool eval(const std::string& script,
+              const std::vector<std::string>& keys,
+              const std::vector<std::string>& args,
+              std::string& result,
+              std::string& error) override {
+        lastScript = script;
+        lastKeys = keys;
+        lastArgs = args;
+        if (fail) {
+            error = "simulated store failure";
+            return false;
+        }
+        error.clear();
+        result = "1|1|0|0|0";
+        return true;
+    }
+
+    std::string lastScript;
+    std::vector<std::string> lastKeys;
+    std::vector<std::string> lastArgs;
+    bool fail = false;
+};
+
 using namespace std::chrono_literals;
 
 #ifdef _WIN32
@@ -743,6 +773,173 @@ void testStateStore() {
     }
 }
 
+void testHardening() {
+    section("Correctness and Security Hardening");
+
+    {
+        std::string error;
+        check(!createStrategy("TokenBucket", {{"capacity", 0}, {"refill", 1}}, &error)
+              && error.find("capacity") != std::string::npos,
+              "Strategy validation rejects zero capacity");
+        error.clear();
+        check(!createStrategy("TokenBucket", {{"capacity", 1}, {"refill", -1}}, &error)
+              && error.find("refill") != std::string::npos,
+              "Strategy validation rejects negative refill");
+        error.clear();
+        check(!createStrategy("FixedWindowCounter", {{"limit", 1.5}, {"window", 1}}, &error)
+              && error.find("integer") != std::string::npos,
+              "Strategy validation rejects fractional request limits");
+    }
+
+    {
+        Policy policy;
+        policy.algorithm = "TokenBucket";
+        policy.params = {{"capacity", 2}, {"refill", 0}};
+        std::string first = buildPolicyKey("tenant", "/first", policy);
+        std::string second = buildPolicyKey("tenant", "/second", policy);
+        check(first != second,
+              "Composite policy keys isolate endpoints with identical limits");
+    }
+
+    {
+        auto duplicate = JsonCodec::decodeEvaluateRequest(
+            "{\"tenant\":\"a\",\"tenant\":\"b\",\"endpoint\":\"/x\"}");
+        auto trailing = JsonCodec::decodeEvaluateRequest(
+            "{\"tenant\":\"a\",\"endpoint\":\"/x\"} trailing");
+        auto unknown = JsonCodec::decodeEvaluateRequest(
+            "{\"tenant\":\"a\",\"endpoint\":\"/x\",\"extra\":1}");
+        check(!duplicate.ok && !trailing.ok && !unknown.ok,
+              "JSON parser rejects duplicate keys, trailing content, and unknown fields");
+
+        auto mixedMatch = JsonCodec::decodePolicy(
+            "{\"algorithm\":\"TokenBucket\",\"tenant\":\"a\","
+            "\"match\":{\"tenant\":\"b\"},\"params\":{\"capacity\":1,\"refill\":0}}");
+        auto mixedParams = JsonCodec::decodePolicy(
+            "{\"algorithm\":\"TokenBucket\",\"capacity\":1,"
+            "\"params\":{\"capacity\":2,\"refill\":0}}");
+        check(!mixedMatch.ok && !mixedParams.ok,
+              "JSON policy decoding rejects ambiguous nested and top-level fields");
+    }
+
+    {
+        RecordingScriptStore store;
+        std::string error;
+        auto log = createStrategy("SlidingWindowLog", {{"limit", 2}, {"window", 10}},
+                                  &store, "tenant|/endpoint", &error);
+        bool allowed = log && log->allowRequest();
+        bool sameSlot = store.lastKeys.size() == 2
+            && store.lastKeys[0].find("{rl:") != std::string::npos
+            && store.lastKeys[1].find("{rl:") != std::string::npos
+            && store.lastKeys[0].substr(store.lastKeys[0].find('{'), 21)
+               == store.lastKeys[1].substr(store.lastKeys[1].find('{'), 21);
+        check(allowed && log->algorithmName() == "SlidingWindowLog"
+              && store.lastScript.find("ZREMRANGEBYSCORE") != std::string::npos
+              && store.lastScript.find("redis.call('TIME')") != std::string::npos,
+              "SlidingWindowLog uses an atomic Redis sorted-set script and Redis time");
+        check(sameSlot, "Redis strategy keys share a cluster hash slot");
+
+        auto bucket = createStrategy("TokenBucket", {{"capacity", 2}, {"refill", 0}},
+                                     &store, "tenant|/bucket", &error);
+        bucket->allowRequest();
+        check(store.lastScript.find("PERSIST") != std::string::npos
+              && store.lastScript.find("or tostring(now)") != std::string::npos
+              && store.lastScript.find("ARGV[3]") == std::string::npos
+              && store.lastArgs.size() == 2,
+              "Zero-refill Redis bucket persists state and does not accept client time");
+    }
+
+    {
+        Policy policy;
+        policy.priority = 1;
+        policy.algorithm = "TokenBucket";
+        policy.params = {{"capacity", 1}, {"refill", 0}};
+        PolicyResolver resolver({policy});
+        PolicyEngine engine;
+        RecordingScriptStore store;
+        store.fail = true;
+        std::string path = testDbPath("test_store_failure");
+        removeTestDb(path);
+        Database db(path);
+        RestController controller(resolver, engine, db, "", &store);
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/evaluate";
+        request.body = "{\"tenant\":\"tenant-a\",\"endpoint\":\"/x\"}";
+        auto response = controller.handleEvaluate(request);
+        check(response.status == 503
+              && response.body.find("unavailable") != std::string::npos,
+              "State-store failures return 503 instead of ordinary rate-limit denial");
+        removeTestDb(path);
+    }
+
+    {
+        Policy policy;
+        policy.priority = 1;
+        policy.algorithm = "TokenBucket";
+        policy.params = {{"capacity", 2}, {"refill", 0}};
+        PolicyResolver resolver({policy});
+        PolicyEngine engine;
+        std::string path = testDbPath("test_auth_controller");
+        removeTestDb(path);
+        Database db(path);
+        std::map<std::string, std::string> tenantTokens = {
+            {"tenant-a", "tenant-a-token-123456"}
+        };
+        RestController controller(resolver, engine, db, "", nullptr,
+                                  tenantTokens, "admin-token-12345678");
+        HttpRequest evaluate;
+        evaluate.method = "POST";
+        evaluate.path = "/evaluate";
+        evaluate.body = "{\"tenant\":\"tenant-a\",\"endpoint\":\"/x\"}";
+        auto missing = controller.handleEvaluate(evaluate);
+        evaluate.headers["Authorization"] = "Bearer wrong-token-123456";
+        auto wrong = controller.handleEvaluate(evaluate);
+        evaluate.headers["Authorization"] = "Bearer tenant-a-token-123456";
+        auto accepted = controller.handleEvaluate(evaluate);
+        check(missing.status == 401 && wrong.status == 403 && accepted.status == 200,
+              "Tenant bearer tokens prevent missing, wrong, and cross-tenant credentials");
+
+        HttpRequest policies;
+        policies.method = "GET";
+        policies.path = "/policies";
+        auto adminMissing = controller.handleGetPolicies(policies);
+        policies.headers["Authorization"] = "Bearer admin-token-12345678";
+        auto adminAccepted = controller.handleGetPolicies(policies);
+        check(adminMissing.status == 401 && adminAccepted.status == 200,
+              "Policy administration requires a separate admin token");
+        removeTestDb(path);
+    }
+
+    {
+        std::string path = testDbPath("test_concurrent_audit");
+        removeTestDb(path);
+        Database db(path);
+        auto writer = [&](int base) {
+            for (int i = 0; i < 50; ++i) {
+                db.logRequest("tenant", base + i, "ALLOW", "TokenBucket", "state");
+            }
+        };
+        std::thread first(writer, 0), second(writer, 100);
+        first.join(); second.join();
+        check(db.getTotalRequests("tenant") == 100,
+              "Concurrent audit appends are synchronized and lossless");
+        removeTestDb(path);
+    }
+
+    {
+        std::string path = testDbPath("test_malformed_audit");
+        removeTestDb(path);
+        {
+            std::ofstream out(path);
+            out << "REQUEST\ttenant\tnot-a-timestamp\tALLOW\tTokenBucket\tstate\n";
+        }
+        Database db(path);
+        check(db.isAvailable() && db.getTotalRequests("tenant") == 0,
+              "Malformed persisted audit rows are skipped without crashing startup");
+        removeTestDb(path);
+    }
+}
+
 // Database
 
 std::string testDbPath(const std::string& name) {
@@ -938,6 +1135,7 @@ int main() {
     testJsonCodec();
     testRestController();
     testStateStore();
+    testHardening();
     testDatabase();
     testMetrics();
     testPersistenceIntegration();

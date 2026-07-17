@@ -3,9 +3,18 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdlib>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
+
+#ifdef _WIN32
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #include <windows.h>
+#endif
 
 namespace {
 std::string trim(const std::string& s) {
@@ -48,7 +57,22 @@ std::string stripQuotes(const std::string& s) {
         char first = out.front();
         char last = out.back();
         if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
-            return out.substr(1, out.size() - 2);
+            std::string inner = out.substr(1, out.size() - 2);
+            if (first == '\'') return inner;
+            std::string decoded;
+            bool escaped = false;
+            for (char c : inner) {
+                if (!escaped && c == '\\') { escaped = true; continue; }
+                if (escaped) {
+                    if (c == 'n') decoded.push_back('\n');
+                    else if (c == 'r') decoded.push_back('\r');
+                    else if (c == 't') decoded.push_back('\t');
+                    else decoded.push_back(c);
+                    escaped = false;
+                } else decoded.push_back(c);
+            }
+            if (escaped) decoded.push_back('\\');
+            return decoded;
         }
     }
     return out;
@@ -65,7 +89,7 @@ bool splitKeyValue(const std::string& line, std::string& key, std::string& value
 bool parseInt(const std::string& value, int& out) {
     char* end = nullptr;
     long parsed = std::strtol(value.c_str(), &end, 10);
-    if (end == value.c_str() || *end != '\0') return false;
+    if (end == value.c_str() || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) return false;
     out = static_cast<int>(parsed);
     return true;
 }
@@ -97,6 +121,20 @@ std::string formatLineDouble(double value) {
     std::ostringstream oss;
     oss << value;
     return oss.str();
+}
+
+std::string quoteYaml(const std::string& value) {
+    std::ostringstream out;
+    out << '"';
+    for (char c : value) {
+        if (c == '\\' || c == '"') out << '\\' << c;
+        else if (c == '\n') out << "\\n";
+        else if (c == '\r') out << "\\r";
+        else if (c == '\t') out << "\\t";
+        else out << c;
+    }
+    out << '"';
+    return out.str();
 }
 
 bool applyRootField(Policy& policy,
@@ -157,21 +195,6 @@ bool applyMatchField(Policy& policy,
     return false;
 }
 
-bool validatePolicy(const Policy& policy, std::string& error) {
-    if (policy.algorithm.empty()) {
-        error = "policy is missing algorithm";
-        return false;
-    }
-    if (policy.algorithm != "TokenBucket"
-        && policy.algorithm != "FixedWindowCounter"
-        && policy.algorithm != "SlidingWindowLog"
-        && policy.algorithm != "SlidingWindowCounter"
-        && policy.algorithm != "LeakyBucket") {
-        error = "unsupported algorithm: " + policy.algorithm;
-        return false;
-    }
-    return true;
-}
 }
 
 PolicyLoadResult PolicyLoader::loadFromFile(const std::string& path) {
@@ -199,7 +222,7 @@ PolicyLoadResult PolicyLoader::loadFromFile(const std::string& path) {
     auto flush = [&]() -> bool {
         if (!inPolicy) return true;
         std::string error;
-        if (!validatePolicy(current, error)) {
+        if (!validatePolicyConfiguration(current, error)) {
             result.error = path + ": " + error;
             return false;
         }
@@ -268,12 +291,42 @@ PolicyLoadResult PolicyLoader::loadFromFile(const std::string& path) {
 bool PolicyLoader::saveToFile(const std::string& path,
                               const std::vector<Policy>& policies,
                               std::string* error) {
-    std::ofstream out(path);
+    for (const auto& policy : policies) {
+        std::string validationError;
+        if (!validatePolicyConfiguration(policy, validationError)) {
+            if (error) *error = validationError;
+            return false;
+        }
+    }
+
+    const std::string temporaryPath = path + ".tmp";
+    std::ofstream out(temporaryPath, std::ios::trunc);
     if (!out) {
-        if (error) *error = "unable to write policy file: " + path;
+        if (error) *error = "unable to write policy file: " + temporaryPath;
         return false;
     }
     out << toYaml(policies);
+    out.close();
+    if (!out) {
+        std::remove(temporaryPath.c_str());
+        if (error) *error = "unable to finish policy file: " + temporaryPath;
+        return false;
+    }
+#ifdef _WIN32
+    bool replaced = false;
+    for (int attempt = 0; attempt < 5 && !replaced; ++attempt) {
+        replaced = MoveFileExA(temporaryPath.c_str(), path.c_str(),
+                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        if (!replaced) Sleep(static_cast<DWORD>(10 * (attempt + 1)));
+    }
+    if (!replaced) {
+#else
+    if (std::rename(temporaryPath.c_str(), path.c_str()) != 0) {
+#endif
+        std::remove(temporaryPath.c_str());
+        if (error) *error = "unable to atomically replace policy file: " + path;
+        return false;
+    }
     return true;
 }
 
@@ -283,8 +336,8 @@ std::string PolicyLoader::toYaml(const std::vector<Policy>& policies) {
         out << "- priority: " << policy.priority << "\n";
         if (policy.hasTenant || policy.hasEndpoint) {
             out << "  match:\n";
-            if (policy.hasTenant) out << "    tenant: \"" << policy.matchTenant << "\"\n";
-            if (policy.hasEndpoint) out << "    endpoint: \"" << policy.matchEndpoint << "\"\n";
+            if (policy.hasTenant) out << "    tenant: " << quoteYaml(policy.matchTenant) << "\n";
+            if (policy.hasEndpoint) out << "    endpoint: " << quoteYaml(policy.matchEndpoint) << "\n";
         }
         out << "  algorithm: " << policy.algorithm << "\n";
         for (const auto& param : policy.params) {

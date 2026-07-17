@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <algorithm>
+#include <cmath>
 #include "PolicyEngine.h"
 #include "TokenBucket.h"
 #include "FixedWindowCounter.h"
@@ -50,6 +51,11 @@ long long timestampMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(now - programStart()).count();
 }
 
+long long epochTimestampMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 // Relative timestamp in ms from program start
 std::string timestamp() {
     std::ostringstream oss;
@@ -82,19 +88,31 @@ std::unique_ptr<RateLimitStrategy> makeStrategy(const std::string& algorithm,
     auto p = parseParams(params);
     try {
         if (algorithm == "TokenBucket") {
-            return std::make_unique<TokenBucket>(std::stod(p["capacity"]), std::stod(p["refill"]));
+            double capacity = std::stod(p["capacity"]), refill = std::stod(p["refill"]);
+            if (!std::isfinite(capacity) || !std::isfinite(refill)
+                || capacity <= 0 || refill < 0) return nullptr;
+            return std::make_unique<TokenBucket>(capacity, refill);
         }
         if (algorithm == "FixedWindowCounter") {
-            return std::make_unique<FixedWindowCounter>(std::stoi(p["limit"]), std::stod(p["window"]));
+            int limit = std::stoi(p["limit"]); double window = std::stod(p["window"]);
+            if (limit <= 0 || !std::isfinite(window) || window <= 0) return nullptr;
+            return std::make_unique<FixedWindowCounter>(limit, window);
         }
         if (algorithm == "SlidingWindowLog") {
-            return std::make_unique<SlidingWindowLog>(std::stoi(p["limit"]), std::stod(p["window"]));
+            int limit = std::stoi(p["limit"]); double window = std::stod(p["window"]);
+            if (limit <= 0 || !std::isfinite(window) || window <= 0) return nullptr;
+            return std::make_unique<SlidingWindowLog>(limit, window);
         }
         if (algorithm == "SlidingWindowCounter") {
-            return std::make_unique<SlidingWindowCounter>(std::stoi(p["limit"]), std::stod(p["window"]));
+            int limit = std::stoi(p["limit"]); double window = std::stod(p["window"]);
+            if (limit <= 0 || !std::isfinite(window) || window <= 0) return nullptr;
+            return std::make_unique<SlidingWindowCounter>(limit, window);
         }
         if (algorithm == "LeakyBucket") {
-            return std::make_unique<LeakyBucket>(std::stod(p["capacity"]), std::stod(p["leakRate"]));
+            double capacity = std::stod(p["capacity"]), leak = std::stod(p["leakRate"]);
+            if (!std::isfinite(capacity) || !std::isfinite(leak)
+                || capacity <= 0 || leak < 0) return nullptr;
+            return std::make_unique<LeakyBucket>(capacity, leak);
         }
     } catch (...) {
         return nullptr;
@@ -103,7 +121,7 @@ std::unique_ptr<RateLimitStrategy> makeStrategy(const std::string& algorithm,
 }
 
 void logEvaluation(Database& db, PolicyEngine& engine, const std::string& id, bool ok) {
-    db.logRequest(id, timestampMs(), ok ? "ALLOW" : "DENY",
+    db.logRequest(id, epochTimestampMs(), ok ? "ALLOW" : "DENY",
                   engine.getAlgorithm(id), engine.getState(id));
 }
 
@@ -121,6 +139,10 @@ void setPolicyMenu(PolicyEngine& engine, Database& db, const std::string& tenant
         double cap, rate;
         std::cout << "Capacity (burst ceiling): ";  std::cin >> cap;
         std::cout << "Refill rate (tokens/sec): ";  std::cin >> rate;
+        if (!std::isfinite(cap) || !std::isfinite(rate) || cap <= 0 || rate < 0) {
+            std::cout << "Capacity must be positive and refill must be non-negative.\n";
+            return;
+        }
         engine.setPolicy(tenantId, std::make_unique<TokenBucket>(cap, rate));
         db.saveTenant(tenantId, tenantId, "TokenBucket", makeParams("capacity", cap, "refill", rate));
         std::cout << "TokenBucket set: cap=" << cap << " rate=" << rate << "/s\n";
@@ -129,6 +151,10 @@ void setPolicyMenu(PolicyEngine& engine, Database& db, const std::string& tenant
         int limit; double window;
         std::cout << "Limit (requests/window): ";  std::cin >> limit;
         std::cout << "Window size (seconds): ";     std::cin >> window;
+        if (limit <= 0 || !std::isfinite(window) || window <= 0) {
+            std::cout << "Limit and window must be positive.\n";
+            return;
+        }
         engine.setPolicy(tenantId, std::make_unique<FixedWindowCounter>(limit, window));
         db.saveTenant(tenantId, tenantId, "FixedWindowCounter", makeParams("limit", limit, "window", window));
         std::cout << "FixedWindowCounter set: limit=" << limit << " window=" << window << "s\n";
@@ -137,6 +163,10 @@ void setPolicyMenu(PolicyEngine& engine, Database& db, const std::string& tenant
         int limit; double window;
         std::cout << "Limit (requests/window): ";  std::cin >> limit;
         std::cout << "Window size (seconds): ";     std::cin >> window;
+        if (limit <= 0 || !std::isfinite(window) || window <= 0) {
+            std::cout << "Limit and window must be positive.\n";
+            return;
+        }
         engine.setPolicy(tenantId, std::make_unique<SlidingWindowLog>(limit, window));
         db.saveTenant(tenantId, tenantId, "SlidingWindowLog", makeParams("limit", limit, "window", window));
         std::cout << "SlidingWindowLog set: limit=" << limit << " window=" << window << "s\n";
@@ -145,6 +175,10 @@ void setPolicyMenu(PolicyEngine& engine, Database& db, const std::string& tenant
         int limit; double window;
         std::cout << "Limit (requests/window): ";  std::cin >> limit;
         std::cout << "Window size (seconds): ";     std::cin >> window;
+        if (limit <= 0 || !std::isfinite(window) || window <= 0) {
+            std::cout << "Limit and window must be positive.\n";
+            return;
+        }
         engine.setPolicy(tenantId, std::make_unique<SlidingWindowCounter>(limit, window));
         db.saveTenant(tenantId, tenantId, "SlidingWindowCounter", makeParams("limit", limit, "window", window));
         std::cout << "SlidingWindowCounter set: limit=" << limit << " window=" << window << "s\n";
@@ -153,6 +187,10 @@ void setPolicyMenu(PolicyEngine& engine, Database& db, const std::string& tenant
         double cap, rate;
         std::cout << "Capacity (queue depth): ";   std::cin >> cap;
         std::cout << "Leak rate (requests/sec): "; std::cin >> rate;
+        if (!std::isfinite(cap) || !std::isfinite(rate) || cap <= 0 || rate < 0) {
+            std::cout << "Capacity must be positive and leak rate must be non-negative.\n";
+            return;
+        }
         engine.setPolicy(tenantId, std::make_unique<LeakyBucket>(cap, rate));
         db.saveTenant(tenantId, tenantId, "LeakyBucket", makeParams("capacity", cap, "leakRate", rate));
         std::cout << "LeakyBucket set: cap=" << cap << " leak=" << rate << "/s\n";
@@ -359,7 +397,7 @@ int main() {
         }
     }
     if (restored > 0) {
-        std::cout << "Restored " << restored << " tenant policies from SQLite.\n";
+        std::cout << "Restored " << restored << " tenant policies from the local store.\n";
     }
 
     while (true) {

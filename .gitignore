@@ -16,3 +16,8 @@
 .DS_Store
 Thumbs.db
 
+# Local runtime data and secrets
+.env
+data/
+rlimit_store.txt
+

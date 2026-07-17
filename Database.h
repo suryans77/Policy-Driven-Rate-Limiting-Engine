@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <mutex>
 
 struct TenantRecord {
     std::string id;
@@ -27,12 +28,12 @@ public:
 
     bool isAvailable() const;
 
-    void saveTenant(const std::string& id, const std::string& name,
+    bool saveTenant(const std::string& id, const std::string& name,
                     const std::string& algorithm, const std::string& params);
-    void deleteTenant(const std::string& id);
+    bool deleteTenant(const std::string& id);
     std::vector<TenantRecord> loadAllTenants();
 
-    void logRequest(const std::string& tenantId, long long timestampMs,
+    bool logRequest(const std::string& tenantId, long long timestampMs,
                     const std::string& result, const std::string& algorithm,
                     const std::string& stateSnapshot);
 
@@ -52,8 +53,10 @@ private:
 
     std::vector<TenantRecord> tenants_;
     std::vector<StoredRequest> requests_;
+    mutable std::mutex mutex_;
 
     void loadFromFile();
     bool flushToFile() const;
+    bool appendRequestToFile(const StoredRequest& request) const;
     void printError(const std::string& message) const;
 };

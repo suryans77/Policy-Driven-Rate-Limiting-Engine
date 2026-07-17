@@ -5,14 +5,36 @@ services:
       - "8080:8080"
     environment:
       HTTP_PORT: "8080"
+      HTTP_WORKERS: "4"
+      HTTP_MAX_QUEUE: "256"
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      POLICY_FILE: policy/policies.yaml
-      AUDIT_STORE_PATH: rlimit_store.txt
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"
+      ADMIN_API_KEY: "${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}"
+      TENANT_API_KEYS: "${TENANT_API_KEYS:?Set TENANT_API_KEYS in .env}"
+      POLICY_FILE: /data/policies.yaml
+      AUDIT_STORE_PATH: /data/rlimit_store.txt
+    volumes:
+      - rlimit-data:/data
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"
+    restart: unless-stopped
+
+volumes:
+  rlimit-data:
+  redis-data:

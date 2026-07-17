@@ -14,12 +14,14 @@ public:
         std::vector<Reply> items;
     };
 
-    RedisStateStore(const std::string& host, int port);
+    RedisStateStore(const std::string& host, int port,
+                    const std::string& password = "");
 
     bool get(const std::string& key, std::string& value) override;
     void set(const std::string& key, const std::string& value) override;
     long long incr(const std::string& key) override;
     void expire(const std::string& key, int seconds) override;
+    bool health(std::string& error) override;
 
     bool supportsAtomicScripts() const override;
     bool eval(const std::string& script,
@@ -33,4 +35,5 @@ private:
 
     std::string host_;
     int port_;
+    std::string password_;
 };

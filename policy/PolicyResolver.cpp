@@ -1,6 +1,7 @@
 #include "PolicyResolver.h"
 
 #include <algorithm>
+#include <mutex>
 
 namespace {
 std::vector<Policy> sortedPolicies(std::vector<Policy> policies) {
@@ -17,10 +18,13 @@ PolicyResolver::PolicyResolver(const std::vector<Policy>& policies) {
 }
 
 void PolicyResolver::setPolicies(const std::vector<Policy>& policies) {
-    policies_ = sortedPolicies(policies);
+    auto sorted = sortedPolicies(policies);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    policies_ = std::move(sorted);
 }
 
 bool PolicyResolver::resolve(const Request& req, Policy& policy) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     for (const auto& candidate : policies_) {
         if (candidate.matches(req)) {
             policy = candidate;
@@ -30,6 +34,7 @@ bool PolicyResolver::resolve(const Request& req, Policy& policy) const {
     return false;
 }
 
-const std::vector<Policy>& PolicyResolver::policies() const {
+std::vector<Policy> PolicyResolver::policies() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return policies_;
 }

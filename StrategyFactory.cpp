@@ -34,6 +34,14 @@ std::unique_ptr<RateLimitStrategy> createStrategy(
     const std::map<std::string, double>& params,
     std::string* error) {
     std::string normalized = normalizeAlgorithmName(algorithm);
+    Policy candidate;
+    candidate.algorithm = normalized;
+    candidate.params = params;
+    std::string validationError;
+    if (!validatePolicyConfiguration(candidate, validationError)) {
+        if (error) *error = validationError;
+        return nullptr;
+    }
 
     double first = 0.0;
     double second = 0.0;
@@ -74,15 +82,31 @@ std::unique_ptr<RateLimitStrategy> createStrategy(
     const std::string& stateKey,
     std::string* error) {
     std::string normalized = normalizeAlgorithmName(algorithm);
-    if (store && store->supportsAtomicScripts() && normalized != "SlidingWindowLog") {
+    Policy candidate;
+    candidate.algorithm = normalized;
+    candidate.params = params;
+    std::string validationError;
+    if (!validatePolicyConfiguration(candidate, validationError)) {
+        if (error) *error = validationError;
+        return nullptr;
+    }
+    if (store && store->supportsAtomicScripts()) {
         return createRedisBackedStrategy(normalized, params, *store, stateKey, error);
     }
     return createStrategy(normalized, params, error);
 }
 
 std::string buildPolicyKey(const std::string& tenantId, const Policy& policy) {
+    return buildPolicyKey(tenantId, "", policy);
+}
+
+std::string buildPolicyKey(const std::string& tenantId,
+                           const std::string& endpoint,
+                           const Policy& policy) {
     std::ostringstream oss;
-    oss << tenantId << "|" << normalizeAlgorithmName(policy.algorithm)
+    oss << tenantId.size() << ":" << tenantId
+        << "|" << endpoint.size() << ":" << endpoint
+        << "|" << normalizeAlgorithmName(policy.algorithm)
         << "|" << policy.paramsString();
     return oss.str();
 }

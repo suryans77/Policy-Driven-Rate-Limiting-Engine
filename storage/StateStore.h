@@ -9,6 +9,7 @@ public:
     virtual void set(const std::string& key, const std::string& value) = 0;
     virtual long long incr(const std::string& key) = 0;
     virtual void expire(const std::string& key, int seconds) = 0;
+    virtual bool health(std::string& error) { error.clear(); return true; }
 
     virtual bool supportsAtomicScripts() const { return false; }
     virtual bool eval(const std::string& script,

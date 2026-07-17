@@ -25,3 +25,4 @@ struct Policy {
 };
 
 std::string normalizeAlgorithmName(const std::string& algorithm);
+bool validatePolicyConfiguration(const Policy& policy, std::string& error);

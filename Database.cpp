@@ -7,6 +7,14 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
+
+#ifdef _WIN32
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #include <windows.h>
+#endif
 
 namespace {
 std::string encodeField(const std::string& value) {
@@ -73,6 +81,7 @@ Database::Database(const std::string& path)
 }
 
 bool Database::isAvailable() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return available_;
 }
 
@@ -92,7 +101,9 @@ void Database::loadFromFile() {
     }
 
     std::string line;
+    int lineNumber = 0;
     while (std::getline(in, line)) {
+        ++lineNumber;
         auto parts = splitTabs(line);
         if (parts.empty()) continue;
 
@@ -104,13 +115,21 @@ void Database::loadFromFile() {
             rec.params = decodeField(parts[4]);
             tenants_.push_back(rec);
         } else if (parts[0] == "REQUEST" && parts.size() == 6) {
-            StoredRequest stored;
-            stored.tenantId = decodeField(parts[1]);
-            stored.record.timestampMs = std::stoll(parts[2]);
-            stored.record.result = decodeField(parts[3]);
-            stored.record.algorithm = decodeField(parts[4]);
-            stored.record.stateSnapshot = decodeField(parts[5]);
-            requests_.push_back(stored);
+            try {
+                std::size_t consumed = 0;
+                long long timestamp = std::stoll(parts[2], &consumed);
+                if (consumed != parts[2].size()) throw std::invalid_argument("trailing timestamp data");
+                StoredRequest stored;
+                stored.tenantId = decodeField(parts[1]);
+                stored.record.timestampMs = timestamp;
+                stored.record.result = decodeField(parts[3]);
+                stored.record.algorithm = decodeField(parts[4]);
+                stored.record.stateSnapshot = decodeField(parts[5]);
+                requests_.push_back(stored);
+            } catch (const std::exception&) {
+                printError("ignoring malformed request record at line "
+                           + std::to_string(lineNumber));
+            }
         }
     }
 }
@@ -118,9 +137,10 @@ void Database::loadFromFile() {
 bool Database::flushToFile() const {
     if (!available_) return false;
 
-    std::ofstream out(path_, std::ios::trunc);
+    const std::string temporaryPath = path_ + ".tmp";
+    std::ofstream out(temporaryPath, std::ios::trunc);
     if (!out) {
-        printError("unable to write " + path_);
+        printError("unable to write " + temporaryPath);
         return false;
     }
 
@@ -143,12 +163,52 @@ bool Database::flushToFile() const {
             << '\n';
     }
 
+    out.close();
+    if (!out) {
+        printError("unable to finish writing " + temporaryPath);
+        std::remove(temporaryPath.c_str());
+        return false;
+    }
+
+#ifdef _WIN32
+    bool replaced = false;
+    for (int attempt = 0; attempt < 5 && !replaced; ++attempt) {
+        replaced = MoveFileExA(temporaryPath.c_str(), path_.c_str(),
+                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        if (!replaced) Sleep(static_cast<DWORD>(10 * (attempt + 1)));
+    }
+    if (!replaced) {
+        printError("unable to atomically replace " + path_);
+        std::remove(temporaryPath.c_str());
+        return false;
+    }
+#else
+    if (std::rename(temporaryPath.c_str(), path_.c_str()) != 0) {
+        printError("unable to atomically replace " + path_);
+        std::remove(temporaryPath.c_str());
+        return false;
+    }
+#endif
     return true;
 }
 
-void Database::saveTenant(const std::string& id, const std::string& name,
+bool Database::appendRequestToFile(const StoredRequest& request) const {
+    std::ofstream out(path_, std::ios::app);
+    if (!out) return false;
+    out << "REQUEST"
+        << '\t' << encodeField(request.tenantId)
+        << '\t' << request.record.timestampMs
+        << '\t' << encodeField(request.record.result)
+        << '\t' << encodeField(request.record.algorithm)
+        << '\t' << encodeField(request.record.stateSnapshot)
+        << '\n';
+    return static_cast<bool>(out);
+}
+
+bool Database::saveTenant(const std::string& id, const std::string& name,
                           const std::string& algorithm, const std::string& params) {
-    if (!available_) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!available_) return false;
 
     auto it = std::find_if(tenants_.begin(), tenants_.end(),
         [&](const TenantRecord& rec) { return rec.id == id; });
@@ -159,18 +219,28 @@ void Database::saveTenant(const std::string& id, const std::string& name,
     } else {
         *it = rec;
     }
-    flushToFile();
+    if (!flushToFile()) {
+        available_ = false;
+        return false;
+    }
+    return true;
 }
 
-void Database::deleteTenant(const std::string& id) {
-    if (!available_) return;
+bool Database::deleteTenant(const std::string& id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!available_) return false;
 
     tenants_.erase(std::remove_if(tenants_.begin(), tenants_.end(),
         [&](const TenantRecord& rec) { return rec.id == id; }), tenants_.end());
-    flushToFile();
+    if (!flushToFile()) {
+        available_ = false;
+        return false;
+    }
+    return true;
 }
 
 std::vector<TenantRecord> Database::loadAllTenants() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!available_) return {};
 
     auto tenants = tenants_;
@@ -181,10 +251,11 @@ std::vector<TenantRecord> Database::loadAllTenants() {
     return tenants;
 }
 
-void Database::logRequest(const std::string& tenantId, long long timestampMs,
+bool Database::logRequest(const std::string& tenantId, long long timestampMs,
                           const std::string& result, const std::string& algorithm,
                           const std::string& stateSnapshot) {
-    if (!available_) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!available_) return false;
 
     StoredRequest stored;
     stored.tenantId = tenantId;
@@ -193,10 +264,26 @@ void Database::logRequest(const std::string& tenantId, long long timestampMs,
     stored.record.algorithm = algorithm;
     stored.record.stateSnapshot = stateSnapshot;
     requests_.push_back(stored);
-    flushToFile();
+    constexpr std::size_t maxAuditRecords = 100000;
+    if (requests_.size() > maxAuditRecords) {
+        requests_.erase(requests_.begin(),
+                        requests_.begin() + static_cast<std::ptrdiff_t>(
+                            requests_.size() - maxAuditRecords));
+        if (!flushToFile()) {
+            printError("unable to compact audit store");
+            available_ = false;
+            return false;
+        }
+    } else if (!appendRequestToFile(stored)) {
+        printError("unable to append request to " + path_);
+        available_ = false;
+        return false;
+    }
+    return true;
 }
 
 std::vector<RequestRecord> Database::getRequestLog(const std::string& tenantId, int limit) {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<RequestRecord> records;
     if (!available_) return records;
 
@@ -209,6 +296,7 @@ std::vector<RequestRecord> Database::getRequestLog(const std::string& tenantId, 
 }
 
 int Database::getTotalRequests(const std::string& tenantId) {
+    std::lock_guard<std::mutex> lock(mutex_);
     int count = 0;
     for (const auto& request : requests_) {
         if (request.tenantId == tenantId) ++count;
@@ -217,6 +305,7 @@ int Database::getTotalRequests(const std::string& tenantId) {
 }
 
 int Database::getTotalAllowed(const std::string& tenantId) {
+    std::lock_guard<std::mutex> lock(mutex_);
     int count = 0;
     for (const auto& request : requests_) {
         if (request.tenantId == tenantId && request.record.result == "ALLOW") ++count;
@@ -225,6 +314,7 @@ int Database::getTotalAllowed(const std::string& tenantId) {
 }
 
 int Database::getTotalDenied(const std::string& tenantId) {
+    std::lock_guard<std::mutex> lock(mutex_);
     int count = 0;
     for (const auto& request : requests_) {
         if (request.tenantId == tenantId && request.record.result == "DENY") ++count;
